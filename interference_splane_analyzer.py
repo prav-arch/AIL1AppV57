@@ -1,37 +1,65 @@
 #!/usr/bin/env python3
 """
-Rule engine: Interference & S-Plane delay issues.
-Outputs interference_splane_issues.json
+interference_splane_analyzer.py
+───────────────────────────────
+Rule engine that scans DU and CU logs for:
+  • Interference events (SINR drop, RSRP very low, CRC burst, Timing drift)
+  • S-Plane delay events  (F1 / RRC setup latency)
+Always outputs a JSON array where each item has **timestamp**.
 """
 
 import re, json
 from pathlib import Path
 from datetime import datetime
 
-BASE=Path("/home/users/praveen.joe/logs")
-DU=BASE/"dulogs.txt"
-CU=BASE/"cucplog.txt"
-OUT=BASE/"interference_splane_issues.json"
+# ---------- paths ----------------------------------------------------
+BASE = Path("/home/users/praveen.joe/logs")
+DU_LOG = BASE / "dulogs.txt"
+CU_LOG = BASE / "cucplog.txt"
+OUT    = BASE / "interference_splane_issues.json"
 
-INT=r"SINR drop|RSRP at -\\d+ dBm|CRC error|Timing drift"
-SPD=r"F1SetupRequest took (\\d+)ms|UEContextSetupRequest took (\\d+)ms|RRCSetup delayed"
+# ---------- regex patterns ------------------------------------------
+PAT_INTERFERENCE = r"SINR drop|RSRP at -\d+\s*dBm|CRC error|Timing drift"
+PAT_SPLANE_DELAY = r"F1SetupRequest took \d+ms|UEContextSetupRequest took \d+ms|RRCSetup delayed"
 
-def scan(file, patt):
-    ev=[]
-    if not file.exists(): return ev
-    for ln in file.read_text(errors="ignore").splitlines():
-        if re.search(patt,ln,re.I):
-            ts=re.search(r"\\[(\\d{2}:\\d{2}:\\d{2})\\]",ln)
-            iso=datetime.utcnow().strftime("%Y-%m-%dT")+(ts.group(1) if ts else "00:00:00")+"Z"
-            ev.append({"timestamp":iso,"severity":"high","type":"interference" if patt==INT else "s_plane_delay",
-                       "log_line":ln.strip()})
-    return ev
+# ---------- helper ---------------------------------------------------
+def build_timestamp(hms: str | None) -> str:
+    """Return ISO timestamp. If log line lacks [hh:mm:ss], use current UTC time."""
+    if hms:
+        today = datetime.utcnow().strftime("%Y-%m-%dT")
+        return f"{today}{hms}Z"
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+def scan_log(path: Path, pattern: str, issue_type: str):
+    """Return list of violation dicts for one log file."""
+    events = []
+    if not path.exists():
+        print(f"[int_rule] WARNING: {path.name} not found")
+        return events
+
+    regex = re.compile(pattern, re.I)
+    for line in path.read_text(errors="ignore").splitlines():
+        if regex.search(line):
+            hhmmss = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
+            events.append({
+                "timestamp": build_timestamp(hhmmss.group(1) if hhmmss else None),
+                "type": issue_type,
+                "severity": "high",
+                "log_line": line.strip()
+            })
+    print(f"[int_rule] {len(events):>4} {issue_type} events in {path.name}")
+    return events
+
+# ---------- main -----------------------------------------------------
 def main():
-    res=[]
-    res+=scan(DU,INT)
-    res+=scan(CU,SPD)
-    OUT.write_text(json.dumps(res,indent=2))
-    print("[int_rule] wrote",len(res),"issues →",OUT)
+    results = []
+    results += scan_log(DU_LOG, PAT_INTERFERENCE, "interference")
+    results += scan_log(CU_LOG, PAT_INTERFERENCE, "interference")      # CU may log CRC/Timing too
+    results += scan_log(DU_LOG, PAT_SPLANE_DELAY, "s_plane_delay")
+    results += scan_log(CU_LOG, PAT_SPLANE_DELAY, "s_plane_delay")
 
-if __name__=="__main__": main()
+    OUT.write_text(json.dumps(results, indent=2))
+    print(f"[int_rule] Wrote {len(results)} events → {OUT}")
+
+if __name__ == "__main__":
+    main()
