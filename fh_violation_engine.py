@@ -30,6 +30,11 @@ CU_RULES = [
      "description": "UEContext delay"}
 ]
 
+def get_event_time(dt=None):
+    if dt is None:
+        dt = datetime.utcnow()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 def log(msg: str) -> None:
     print(f"[fh_engine] {msg}")
 
@@ -42,11 +47,15 @@ def scan_log(path: Path, rules, source: str):
         for rule in rules:
             if re.search(rule["pattern"], line, re.IGNORECASE):
                 ts = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
-                iso = (datetime.utcnow().strftime("%Y-%m-%dT")
+                try:
+                    iso = (datetime.utcnow().strftime("%Y-%m-%dT")
                        + (ts.group(1) if ts else "00:00:00") + "Z")
+                    event_dt = datetime.strptime(iso.split("T")[0] + " " + iso.split("T")[1][:8], "%Y-%m-%d %H:%M:%S")
+                except:
+                    event_dt = datetime.utcnow()
                 ev = {
                     "timestamp": iso,
-                    "event_time": iso.replace('T', ' ').replace('Z', ''),
+                    "event_time": get_event_time(event_dt),
                     "type": rule["type"],
                     "description": rule["description"],
                     "severity": rule["severity"],
@@ -72,10 +81,17 @@ def is_ecpri_transport(pkt) -> bool:
 
 def pcap_violation(pkt, vtype, desc, sev):
     log(f"  • {vtype} ({desc})")
-    ts = pkt.sniff_time.isoformat() + "Z"
+    ts = pkt.sniff_time
+    if isinstance(ts, str):
+        try:
+            ts = datetime.strptime(ts.split("T")[0] + " " + ts.split("T")[1][:8], "%Y-%m-%d %H:%M:%S")
+        except:
+            ts = datetime.utcnow()
+    elif not isinstance(ts, datetime):
+        ts = datetime.utcnow()
     return {
-        "timestamp": ts,
-        "event_time": ts.replace('T', ' ').replace('Z', ''),
+        "timestamp": ts.isoformat(timespec="seconds")+"Z",
+        "event_time": get_event_time(ts),
         "type": vtype,
         "description": desc,
         "severity": sev,
@@ -137,7 +153,7 @@ def parse_pcap(pcap_path: Path):
 def insert_to_clickhouse(records, table, fields):
     import tempfile
     if not records:
-        now = datetime.utcnow().isoformat(sep=' ')
+        now = get_event_time()
         records = [{
             "event_time": now,
             "type": "none",

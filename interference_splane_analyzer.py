@@ -12,6 +12,11 @@ OUT    = BASE / "interference_splane_issues.json"
 PAT_INTERF = r"SINR drop|RSRP at -\d+\s*dBm|CRC error|Timing drift"
 PAT_SPDLY  = r"F1SetupRequest took \d+ms|UEContextSetupRequest took \d+ms|RRCSetup delayed"
 
+def get_event_time(dt=None):
+    if dt is None:
+        dt = datetime.utcnow()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 def build_timestamp(hms: Optional[str]) -> str:
     if hms:
         today = datetime.utcnow().strftime("%Y-%m-%dT")
@@ -27,9 +32,14 @@ def scan(path: Path, pat: str, itype: str):
         if rgx.search(ln):
             t = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", ln)
             ts = build_timestamp(t.group(1) if t else None)
+            # Parse timestamp to event_time
+            try:
+                event_dt = datetime.strptime(ts.split("T")[0] + " " + ts.split("T")[1][:8], "%Y-%m-%d %H:%M:%S")
+            except:
+                event_dt = datetime.utcnow()
             ev.append({
                 "timestamp": ts,
-                "event_time": ts.replace('T', ' ').replace('Z', ''),
+                "event_time": get_event_time(event_dt),
                 "type"     : itype,
                 "severity" : "high",
                 "log_line" : ln.strip()
@@ -40,7 +50,7 @@ def scan(path: Path, pat: str, itype: str):
 def insert_to_clickhouse(records, table, fields):
     import tempfile
     if not records:
-        now = datetime.utcnow().isoformat(sep=' ')
+        now = get_event_time()
         records = [{
             "event_time": now,
             "type": "none",

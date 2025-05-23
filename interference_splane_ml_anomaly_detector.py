@@ -5,13 +5,18 @@ from pathlib import Path
 import subprocess
 from datetime import datetime
 
+def get_event_time(dt=None):
+    if dt is None:
+        dt = datetime.utcnow()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 INPUT_JSON = "/home/users/praveen.joe/logs/interference_splane_issues.json"
 OUTPUT_JSON = "/home/users/praveen.joe/logs/interference_splane_ml_anomalies.json"
 
 def insert_to_clickhouse(records, table, fields):
     import tempfile
     if not records:
-        now = datetime.utcnow().isoformat(sep=' ')
+        now = get_event_time()
         records = [{
             "event_time": now,
             "type": "none",
@@ -50,6 +55,15 @@ if "severity" not in df.columns:
 
 df["is_high"] = df["severity"] == "high"
 anomalies = df[df["is_high"]].to_dict(orient="records")
+for a in anomalies:
+    if "event_time" in a:
+        try:
+            dt = datetime.strptime(a["event_time"][:19], "%Y-%m-%d %H:%M:%S")
+            a["event_time"] = get_event_time(dt)
+        except Exception:
+            a["event_time"] = get_event_time()
+    else:
+        a["event_time"] = get_event_time()
 print(f"[ML] wrote {len(anomalies)} anomalies → {OUTPUT_JSON}")
 Path(OUTPUT_JSON).write_text(json.dumps(anomalies, indent=2))
 insert_to_clickhouse(anomalies, "interference_splane", ["event_time", "type", "severity", "log_line"])

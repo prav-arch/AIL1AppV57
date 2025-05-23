@@ -12,6 +12,12 @@ OUT    = BASE / "cp_up_coupling_issues.json"
 PAT_CP = re.compile(r"RRC(Setup|Reestablishment|Release)|F1Setup|UEContextSetup", re.I)
 PAT_UP = re.compile(r"DRB release|DL throughput drop|GTP-U tunnel drop|QoS mismatch", re.I)
 
+def get_event_time(dt=None):
+    # Always return 'YYYY-MM-DD HH:MM:SS' for ClickHouse
+    if dt is None:
+        dt = datetime.utcnow()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 def extract_time(line: str) -> Optional[datetime]:
     m = re.search(r"\[(\d{2}):(\d{2}):(\d{2})\]", line)
     if not m: return None
@@ -35,9 +41,10 @@ def correlate(cp, up):
     for c in cp:
         for u in up:
             if abs((u["time"]-c["time"]).total_seconds()) <= 5:
+                event_dt = c["time"]
                 res.append({
-                    "timestamp": c["time"].isoformat(timespec="seconds")+"Z",
-                    "event_time": c["time"].isoformat(sep=' '),
+                    "timestamp": event_dt.isoformat(timespec="seconds")+"Z",
+                    "event_time": get_event_time(event_dt),
                     "severity": "critical",
                     "cp_log": c["log"],
                     "up_log": u["log"]
@@ -47,8 +54,7 @@ def correlate(cp, up):
 def insert_to_clickhouse(records, table, fields):
     import tempfile
     if not records:
-        now = datetime.utcnow().isoformat(sep=' ')
-        # Insert a record marking zero anomalies
+        now = get_event_time()
         records = [{
             "event_time": now,
             "severity": "none",
