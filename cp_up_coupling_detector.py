@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cp_up_coupling_detector.py  (timestamp-safe, Py-3.6+)
+cp_up_coupling_detector.py (timestamp-safe, emits default JSON if no anomaly)
 """
 import re, json
 from pathlib import Path
@@ -52,7 +52,17 @@ def main():
     cp=parse(CP_LOG,PAT_CP,True)
     up=parse(UP_LOG,PAT_UP,False)
     out=correlate(cp,up)
-    OUT.write_text(json.dumps(out,indent=2))
+    if out:
+        OUT.write_text(json.dumps(out,indent=2))
+    else:
+        default = {
+            "status": "ok",
+            "anomaly_count": 0,
+            "message": "No anomalies or errors found in the input log.",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "results": []
+        }
+        OUT.write_text(json.dumps(default, indent=2))
     print(f"[cp_up_rule] wrote {len(out)} coupling issues → {OUT}")
 
 if __name__ == "__main__":

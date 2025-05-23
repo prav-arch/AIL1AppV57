@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-fh_violation_engine.py  —  verbose & VLAN-aware
-────────────────────────────────────────────────
-• Scans dulogs.txt, cucplog.txt, ecpri_4.pcap
-• Detects log-based and eCPRI-spec violations
-• Transport check recognises:
-      – Native Ethertype 0xAEFE
-      – 802.1Q single-tag VLAN (outer 0x8100, inner 0xAEFE)
-      – 802.1ad QinQ       (outer 0x88A8, inner VLAN.eth_type 0xAEFE)
-      – UDP/IP (eCPRI over UDP)
-• Prints each violation to console
-• Writes fh_protocol_violations_enhanced.json
+fh_violation_engine.py (VLAN-aware, emits default JSON if no violation)
 """
-
 import re, json, pyshark, sys
 from pathlib import Path
 from datetime import datetime
 
-# ─────────────── configuration ────────────────
 BASE = Path("/home/users/praveen.joe/logs")
 DU_LOG = BASE / "dulogs.txt"
 CU_LOG = BASE / "cucplog.txt"
@@ -45,7 +33,6 @@ CU_RULES = [
      "description": "UEContext delay"}
 ]
 
-# ─────────────── helpers ──────────────────────
 def log(msg: str) -> None:
     print(f"[fh_engine] {msg}")
 
@@ -73,6 +60,18 @@ def scan_log(path: Path, rules, source: str):
     log(f"Found {len(events)} violations in {path.name}")
     return events
 
+def is_ecpri_transport(pkt) -> bool:
+    if hasattr(pkt, "eth") and pkt.eth.type == "0xaefe":
+        return True
+    if hasattr(pkt, "vlan") and getattr(pkt.vlan, "eth_type", None) == "0xaefe":
+        return True
+    if hasattr(pkt, "eth") and pkt.eth.type == "0x88a8" and hasattr(pkt, "vlan_inner"):
+        if getattr(pkt.vlan_inner, "eth_type", None) == "0xaefe":
+            return True
+    if "udp" in pkt:
+        return True
+    return False
+
 def pcap_violation(pkt, vtype, desc, sev):
     log(f"  • {vtype} ({desc})")
     return {
@@ -82,27 +81,6 @@ def pcap_violation(pkt, vtype, desc, sev):
         "severity": sev
     }
 
-# Transport recogniser -------------------------------------------------
-def is_ecpri_transport(pkt) -> bool:
-    """
-    True if native AEFE, VLAN-tagged AEFE, QinQ AEFE, or UDP/IP.
-    """
-    # Native Ethertype 0xAEFE
-    if hasattr(pkt, "eth") and pkt.eth.type == "0xaefe":
-        return True
-    # Single 802.1Q tag: eth.type 0x8100, inside vlan.eth_type = 0xAEFE
-    if hasattr(pkt, "vlan") and getattr(pkt.vlan, "eth_type", None) == "0xaefe":
-        return True
-    # QinQ 802.1ad: outer 0x88A8, inner vlan_inner.eth_type = 0xAEFE
-    if hasattr(pkt, "eth") and pkt.eth.type == "0x88a8" and hasattr(pkt, "vlan_inner"):
-        if getattr(pkt.vlan_inner, "eth_type", None) == "0xaefe":
-            return True
-    # UDP/IP
-    if "udp" in pkt:
-        return True
-    return False
-
-# Pcap parser ----------------------------------------------------------
 def parse_pcap(pcap_path: Path):
     if not pcap_path.exists():
         log("WARNING: pcap not found"); return []
@@ -112,14 +90,12 @@ def parse_pcap(pcap_path: Path):
 
     for pkt in cap:
         try:
-            # Transport validation
             if not is_ecpri_transport(pkt):
                 violations.append(
                     pcap_violation(pkt, "Bad Transport",
                                    "Not eCPRI Ethertype / VLAN AEFE / UDP", "high"))
                 continue
 
-            # Extract raw eCPRI bytes
             raw_hex = (
                 pkt.udp.payload if "udp" in pkt else
                 getattr(pkt, "vlan_inner", pkt).data
@@ -143,7 +119,6 @@ def parse_pcap(pcap_path: Path):
                     pkt, "Payload mismatch",
                     f"{payload_size} hdr vs {len(raw_bytes)-4} act", "high"))
 
-            # IQ Data sequence gap check
             if msg_type == 0 and len(raw_bytes) >= 8:
                 seq = int.from_bytes(raw_bytes[6:8], "big")
                 if last_seq is not None and seq != ((last_seq + 1) & 0xFFFF):
@@ -157,14 +132,23 @@ def parse_pcap(pcap_path: Path):
     log(f"PCAP scan complete – {len(violations)} violations")
     return violations
 
-# Main -----------------------------------------------------------------
 def main():
     log("=== Fronthaul Violation Engine (verbose, VLAN-aware) ===")
     events  = []
     events += scan_log(DU_LOG, DU_RULES, "DU")
     events += scan_log(CU_LOG, CU_RULES, "CU")
     events += parse_pcap(PCAP)
-    OUT.write_text(json.dumps(events, indent=2))
+    if events:
+        OUT.write_text(json.dumps(events, indent=2))
+    else:
+        default = {
+            "status": "ok",
+            "anomaly_count": 0,
+            "message": "No anomalies or errors found in the input log.",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "results": []
+        }
+        OUT.write_text(json.dumps(default, indent=2))
     log(f"Total written: {len(events)} → {OUT}")
 
 if __name__ == "__main__":
