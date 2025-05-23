@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-cp_up_coupling_detector.py (timestamp-safe, emits default JSON if no anomaly)
-"""
-import re, json
+import re, json, subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -17,8 +14,7 @@ PAT_UP = re.compile(r"DRB release|DL throughput drop|GTP-U tunnel drop|QoS misma
 
 def extract_time(line: str) -> Optional[datetime]:
     m = re.search(r"\[(\d{2}):(\d{2}):(\d{2})\]", line)
-    if not m:
-        return None
+    if not m: return None
     h,mn,s = map(int,m.groups())
     today  = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     return today + timedelta(hours=h, minutes=mn, seconds=s)
@@ -41,12 +37,37 @@ def correlate(cp, up):
             if abs((u["time"]-c["time"]).total_seconds()) <= 5:
                 res.append({
                     "timestamp": c["time"].isoformat(timespec="seconds")+"Z",
-                    "type": "CP+UP coupling",
+                    "event_time": c["time"].isoformat(sep=' '),
                     "severity": "critical",
                     "cp_log": c["log"],
                     "up_log": u["log"]
                 })
     return res
+
+def insert_to_clickhouse(records, table, fields):
+    import tempfile
+    if not records:
+        now = datetime.utcnow().isoformat(sep=' ')
+        # Insert a record marking zero anomalies
+        records = [{
+            "event_time": now,
+            "severity": "none",
+            "cp_log": "NO_ANOMALY_FOUND",
+            "up_log": "NO_ANOMALY_FOUND"
+        }]
+    with tempfile.NamedTemporaryFile("w", delete=False) as fout:
+        for row in records:
+            out = {field: row.get(field, "") for field in fields}
+            fout.write(json.dumps(out) + "\n")
+        fname = fout.name
+    cmd = [
+        "clickhouse-client", "--host", "localhost",
+        "--database", "l1_app_db",
+        "--query", f"INSERT INTO {table} ({','.join(fields)}) FORMAT JSONEachRow"
+    ]
+    with open(fname, "rb") as fin:
+        subprocess.run(cmd, stdin=fin)
+    print(f"[ClickHouse] Inserted {len(records)} records into {table}")
 
 def main():
     cp=parse(CP_LOG,PAT_CP,True)
@@ -64,6 +85,11 @@ def main():
         }
         OUT.write_text(json.dumps(default, indent=2))
     print(f"[cp_up_rule] wrote {len(out)} coupling issues → {OUT}")
+    insert_to_clickhouse(
+        out,
+        "cp_up_coupling",
+        ["event_time", "severity", "cp_log", "up_log"]
+    )
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-interference_splane_analyzer.py
-(timestamp-safe, emits default JSON if no anomaly)
-"""
-import re, json
+import re, json, subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -30,14 +26,40 @@ def scan(path: Path, pat: str, itype: str):
     for ln in path.read_text(errors="ignore").splitlines():
         if rgx.search(ln):
             t = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", ln)
+            ts = build_timestamp(t.group(1) if t else None)
             ev.append({
-                "timestamp": build_timestamp(t.group(1) if t else None),
+                "timestamp": ts,
+                "event_time": ts.replace('T', ' ').replace('Z', ''),
                 "type"     : itype,
                 "severity" : "high",
                 "log_line" : ln.strip()
             })
     print(f"[int_rule] {len(ev):>4} {itype} in {path.name}")
     return ev
+
+def insert_to_clickhouse(records, table, fields):
+    import tempfile
+    if not records:
+        now = datetime.utcnow().isoformat(sep=' ')
+        records = [{
+            "event_time": now,
+            "type": "none",
+            "severity": "none",
+            "log_line": "NO_ANOMALY_FOUND"
+        }]
+    with tempfile.NamedTemporaryFile("w", delete=False) as fout:
+        for row in records:
+            out = {field: row.get(field, "") for field in fields}
+            fout.write(json.dumps(out) + "\n")
+        fname = fout.name
+    cmd = [
+        "clickhouse-client", "--host", "localhost",
+        "--database", "l1_app_db",
+        "--query", f"INSERT INTO {table} ({','.join(fields)}) FORMAT JSONEachRow"
+    ]
+    with open(fname, "rb") as fin:
+        subprocess.run(cmd, stdin=fin)
+    print(f"[ClickHouse] Inserted {len(records)} records into {table}")
 
 def main():
     res  = scan(DU_LOG, PAT_INTERF, "interference")
@@ -56,6 +78,11 @@ def main():
         }
         OUT.write_text(json.dumps(default, indent=2))
     print(f"[int_rule] wrote {len(res)} issues → {OUT}")
+    insert_to_clickhouse(
+        res,
+        "interference_splane",
+        ["event_time", "type", "severity", "log_line"]
+    )
 
 if __name__ == "__main__":
     main()

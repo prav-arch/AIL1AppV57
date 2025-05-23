@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-fh_violation_engine.py (VLAN-aware, emits default JSON if no violation)
-"""
-import re, json, pyshark, sys
+import re, json, pyshark, sys, subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -44,16 +41,17 @@ def scan_log(path: Path, rules, source: str):
     for line in path.read_text(errors="ignore").splitlines():
         for rule in rules:
             if re.search(rule["pattern"], line, re.IGNORECASE):
-                ts = re.search(r"\\[(\\d{2}:\\d{2}:\\d{2})\\]", line)
+                ts = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
                 iso = (datetime.utcnow().strftime("%Y-%m-%dT")
                        + (ts.group(1) if ts else "00:00:00") + "Z")
                 ev = {
                     "timestamp": iso,
+                    "event_time": iso.replace('T', ' ').replace('Z', ''),
                     "type": rule["type"],
                     "description": rule["description"],
                     "severity": rule["severity"],
                     "log_line": line.strip(),
-                    "source": source
+                    "transport_ok": 1
                 }
                 events.append(ev)
                 log(f"  • {ev['type']} @ {ev['timestamp']}")
@@ -74,11 +72,15 @@ def is_ecpri_transport(pkt) -> bool:
 
 def pcap_violation(pkt, vtype, desc, sev):
     log(f"  • {vtype} ({desc})")
+    ts = pkt.sniff_time.isoformat() + "Z"
     return {
-        "timestamp": pkt.sniff_time.isoformat() + "Z",
+        "timestamp": ts,
+        "event_time": ts.replace('T', ' ').replace('Z', ''),
         "type": vtype,
         "description": desc,
-        "severity": sev
+        "severity": sev,
+        "log_line": "",
+        "transport_ok": 0 if "Bad Transport" in vtype else 1
     }
 
 def parse_pcap(pcap_path: Path):
@@ -132,6 +134,32 @@ def parse_pcap(pcap_path: Path):
     log(f"PCAP scan complete – {len(violations)} violations")
     return violations
 
+def insert_to_clickhouse(records, table, fields):
+    import tempfile
+    if not records:
+        now = datetime.utcnow().isoformat(sep=' ')
+        records = [{
+            "event_time": now,
+            "type": "none",
+            "severity": "none",
+            "description": "NO_ANOMALY_FOUND",
+            "log_line": "",
+            "transport_ok": 1
+        }]
+    with tempfile.NamedTemporaryFile("w", delete=False) as fout:
+        for row in records:
+            out = {field: row.get(field, "") for field in fields}
+            fout.write(json.dumps(out) + "\n")
+        fname = fout.name
+    cmd = [
+        "clickhouse-client", "--host", "localhost",
+        "--database", "l1_app_db",
+        "--query", f"INSERT INTO {table} ({','.join(fields)}) FORMAT JSONEachRow"
+    ]
+    with open(fname, "rb") as fin:
+        subprocess.run(cmd, stdin=fin)
+    print(f"[ClickHouse] Inserted {len(records)} records into {table}")
+
 def main():
     log("=== Fronthaul Violation Engine (verbose, VLAN-aware) ===")
     events  = []
@@ -150,6 +178,11 @@ def main():
         }
         OUT.write_text(json.dumps(default, indent=2))
     log(f"Total written: {len(events)} → {OUT}")
+    insert_to_clickhouse(
+        events,
+        "fh_violations",
+        ["event_time", "type", "severity", "description", "log_line", "transport_ok"]
+    )
 
 if __name__ == "__main__":
     main()

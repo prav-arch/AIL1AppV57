@@ -1,48 +1,57 @@
 #!/usr/bin/env python3
-"""
-Self-contained fronthaul ML detector.
-– Auto-runs fh_violation_engine.py if violations JSON is absent.
-"""
-
-import json, subprocess, sys
-from pathlib import Path
+import json
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from pathlib import Path
+import subprocess
+from datetime import datetime
 
-BASE  = Path("/home/users/praveen.joe/logs")
-IN_J  = BASE / "fh_protocol_violations_enhanced.json"
-OUT_J = BASE / "fh_ml_anomalies.json"
-ENGINE= BASE / "fh_violation_engine.py"
+INPUT_JSON = "/home/users/praveen.joe/logs/fh_protocol_violations_enhanced.json"
+OUTPUT_JSON = "/home/users/praveen.joe/logs/fh_ml_anomalies.json"
 
-def ensure_json():
-    if IN_J.exists(): return
-    print("[fh_ml] running rule engine …")
-    if not ENGINE.exists(): sys.exit("fh_violation_engine.py missing")
-    subprocess.run([sys.executable, str(ENGINE)], check=True)
-    if not IN_J.exists(): sys.exit("rule engine failed")
+def insert_to_clickhouse(records, table, fields):
+    import tempfile
+    if not records:
+        now = datetime.utcnow().isoformat(sep=' ')
+        records = [{
+            "event_time": now,
+            "type": "none",
+            "severity": "none",
+            "description": "NO_ANOMALY_FOUND",
+            "log_line": "",
+            "transport_ok": 1
+        }]
+    with tempfile.NamedTemporaryFile("w", delete=False) as fout:
+        for row in records:
+            out = {field: row.get(field, "") for field in fields}
+            fout.write(json.dumps(out) + "\n")
+        fname = fout.name
+    cmd = [
+        "clickhouse-client", "--host", "localhost",
+        "--database", "l1_app_db",
+        "--query", f"INSERT INTO {table} ({','.join(fields)}) FORMAT JSONEachRow"
+    ]
+    with open(fname, "rb") as fin:
+        subprocess.run(cmd, stdin=fin)
+    print(f"[ClickHouse] Inserted {len(records)} records into {table}")
 
-def main():
-    ensure_json()
-    df = pd.read_json(IN_J)
-    df["bucket"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d %H:%M")
-    df["high"]   = df["severity"].isin(["high","critical"])
-    feat=(df.groupby("bucket").agg(total=("type","count"),
-                                   hi=("high","sum"),
-                                   types=("type","nunique")).reset_index())
-    iso=IsolationForest(contamination=0.05,random_state=42)
-    X=feat[["total","hi","types"]]
-    feat["anomaly"]=iso.fit_predict(X)==-1
-    feat["score"]=iso.decision_function(X)
-    anom=feat[feat["anomaly"]]
-    out=[]
-    for _,r in anom.iterrows():
-        row=r.to_dict()
-        row["description"]=f"Minute bucket has {row['hi']} high/critical events ({row['total']} total)."
-        bucket_df=df[df["bucket"]==r["bucket"]]
-        row["log_entries"]=bucket_df["log_line"].tolist()[:20]
-        row["events"]=bucket_df.to_dict("records")
-        out.append(row)
-    OUT_J.write_text(json.dumps(out,indent=2))
-    print("[fh_ml] wrote",len(out),"anomalies →",OUT_J)
+with open(INPUT_JSON) as f:
+    data = json.load(f)
 
-if __name__=="__main__": main()
+if not isinstance(data, list) or not data:
+    print(f"[ML] No anomalies found in {INPUT_JSON}. Exiting.")
+    Path(OUTPUT_JSON).write_text("[]")
+    insert_to_clickhouse([], "fh_violations", ["event_time", "type", "severity", "description", "log_line", "transport_ok"])
+    exit(0)
+
+df = pd.DataFrame(data)
+if "severity" not in df.columns:
+    print(f"[ML] No 'severity' column in input data. Exiting.")
+    Path(OUTPUT_JSON).write_text("[]")
+    insert_to_clickhouse([], "fh_violations", ["event_time", "type", "severity", "description", "log_line", "transport_ok"])
+    exit(0)
+
+df["is_anom"] = df["severity"].isin(["high", "critical"])
+anomalies = df[df["is_anom"]].to_dict(orient="records")
+print(f"[ML] wrote {len(anomalies)} anomalies → {OUTPUT_JSON}")
+Path(OUTPUT_JSON).write_text(json.dumps(anomalies, indent=2))
+insert_to_clickhouse(anomalies, "fh_violations", ["event_time", "type", "severity", "description", "log_line", "transport_ok"])

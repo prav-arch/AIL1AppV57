@@ -1,46 +1,55 @@
 #!/usr/bin/env python3
-"""
-Self-contained CP+UP ML detector.
-Auto-runs cp_up_coupling_detector.py if needed.
-"""
-
-import json, subprocess, sys
-from pathlib import Path
+import json
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from pathlib import Path
+import subprocess
+from datetime import datetime
 
-BASE=Path("/home/users/praveen.joe/logs")
-IN_J=BASE/"cp_up_coupling_issues.json"
-OUT_J=BASE/"cp_up_ml_anomalies.json"
-ENGINE=BASE/"cp_up_coupling_detector.py"
+INPUT_JSON = "/home/users/praveen.joe/logs/cp_up_coupling_issues.json"
+OUTPUT_JSON = "/home/users/praveen.joe/logs/cp_up_ml_anomalies.json"
 
-def ensure(): 
-    if IN_J.exists(): return
-    if not ENGINE.exists(): sys.exit("rule engine missing")
-    subprocess.run([sys.executable,str(ENGINE)],check=True)
-    if not IN_J.exists(): sys.exit("engine failed")
+def insert_to_clickhouse(records, table, fields):
+    import tempfile
+    if not records:
+        now = datetime.utcnow().isoformat(sep=' ')
+        records = [{
+            "event_time": now,
+            "severity": "none",
+            "cp_log": "NO_ANOMALY_FOUND",
+            "up_log": "NO_ANOMALY_FOUND"
+        }]
+    with tempfile.NamedTemporaryFile("w", delete=False) as fout:
+        for row in records:
+            out = {field: row.get(field, "") for field in fields}
+            fout.write(json.dumps(out) + "\n")
+        fname = fout.name
+    cmd = [
+        "clickhouse-client", "--host", "localhost",
+        "--database", "l1_app_db",
+        "--query", f"INSERT INTO {table} ({','.join(fields)}) FORMAT JSONEachRow"
+    ]
+    with open(fname, "rb") as fin:
+        subprocess.run(cmd, stdin=fin)
+    print(f"[ClickHouse] Inserted {len(records)} records into {table}")
 
-def main():
-    ensure()
-    df=pd.read_json(IN_J)
-    df["bucket"]=pd.to_datetime(df["timestamp"]).dt.floor("5min")
-    df["crit"]=df["severity"]=="critical"
-    feat=(df.groupby("bucket").agg(crit=("crit","sum"),total=("type","count")).reset_index())
-    iso=IsolationForest(contamination=0.03,random_state=42)
-    X=feat[["crit","total"]]
-    feat["anomaly"]=iso.fit_predict(X)==-1
-    feat["score"]=iso.decision_function(X)
-    an=feat[feat["anomaly"]]
-    out=[]
-    for _,r in an.iterrows():
-        row=r.to_dict()
-        bucket=df[df["bucket"]==r["bucket"]]
-        row["description"]=f"5-min window with {row['crit']} critical events ({row['total']} total)."
-        row["log_entries"]=[(x.get("cp_log") or x.get("up_log") or x.get("log_line"))
-                            for x in bucket.to_dict("records")][:30]
-        row["events"]=bucket.to_dict("records")
-        out.append(row)
-    OUT_J.write_text(json.dumps(out,indent=2,default=str))
-    print("[cp_up_ml] wrote",len(out),"anomalies →",OUT_J)
+with open(INPUT_JSON) as f:
+    data = json.load(f)
 
-if __name__=="__main__": main()
+if not isinstance(data, list) or not data:
+    print(f"[ML] No anomalies found in {INPUT_JSON}. Exiting.")
+    Path(OUTPUT_JSON).write_text("[]")
+    insert_to_clickhouse([], "cp_up_coupling", ["event_time", "severity", "cp_log", "up_log"])
+    exit(0)
+
+df = pd.DataFrame(data)
+if "severity" not in df.columns:
+    print(f"[ML] No 'severity' column in input data. Exiting.")
+    Path(OUTPUT_JSON).write_text("[]")
+    insert_to_clickhouse([], "cp_up_coupling", ["event_time", "severity", "cp_log", "up_log"])
+    exit(0)
+
+df["crit"] = df["severity"] == "critical"
+anomalies = df[df["crit"]].to_dict(orient="records")
+print(f"[ML] wrote {len(anomalies)} anomalies → {OUTPUT_JSON}")
+Path(OUTPUT_JSON).write_text(json.dumps(anomalies, indent=2))
+insert_to_clickhouse(anomalies, "cp_up_coupling", ["event_time", "severity", "cp_log", "up_log"])
